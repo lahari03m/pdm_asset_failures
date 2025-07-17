@@ -1,0 +1,15 @@
+{
+  "summary_type": "master_summary",
+  "total_batches": 0,
+  "aggregated_summary": {
+    "total_critical_assets": 0,
+    "average_days_to_next_failure": 0,
+    "most_common_root_causes": [],
+    "priority_distribution": {},
+    "recommendations": [
+      "Automate alerts for high-risk equipment approaching failure window.",
+      "Increase spare parts availability for assets with common root causes.",
+      "Flag assets with Critical priority and age > 60 months for replacement planning."
+    ]
+  }
+}
