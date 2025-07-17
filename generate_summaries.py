@@ -1,100 +1,92 @@
-
+import os
+import openai
 import pandas as pd
 import json
-import os
+from dotenv import load_dotenv
+from pathlib import Path
 
-# === Settings ===
+# Load API key
+load_dotenv()
+openai.api_key = os.getenv("OPENAI_API_KEY")
+
+# Constants
 INPUT_CSV = "data/sample_data.csv"
-OUTPUT_DIR = "output"
 BATCH_SIZE = 10
+OUTPUT_FOLDER = "output"
+os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
-# === Create output directory ===
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-# === Load CSV ===
+# Read the CSV
 df = pd.read_csv(INPUT_CSV)
 
-# === Helper Functions ===
+def chunk_dataframe(df, size):
+    for i in range(0, len(df), size):
+        yield df.iloc[i:i + size]
 
-def estimate_days_to_failure(age_months, last_maintenance_days, priority):
-    if priority.lower() == "critical":
-        base = 7
-    elif priority.lower() == "high":
-        base = 14
-    elif priority.lower() == "medium":
-        base = 21
-    else:
-        base = 30
-    modifier = (age_months / 60) + (last_maintenance_days / 180)
-    return max(3, int(base / (modifier + 0.1)))
+def generate_prompt(csv_chunk):
+    return f"""
+You are a maintenance analyst.
 
-def compute_downtime_risk_score(age_months, downtime_hours, priority):
-    score = (age_months / 100) * 3 + (downtime_hours / 5) * 3
-    score += {"Low": 1, "Medium": 2, "High": 3, "Critical": 4}.get(priority, 1)
-    return min(round(score, 1), 10.0)
+Given this technician work order data (in CSV row format), generate a JSON array. Each object must include:
 
-# === Split into batches ===
-batches = [df[i:i + BATCH_SIZE] for i in range(0, len(df), BATCH_SIZE)]
+- asset_id
+- asset_type
+- failure_in: human-readable estimate like "within 3 months"
+- reason_for_failure: inferred from the problem_description and history
+- recommended_action: one action based on the cause
 
-# === Process Each Batch ===
-for idx, batch in enumerate(batches):
-    critical_assets = []
+DO NOT repeat the same recommendation across assets.
 
-    for _, row in batch.iterrows():
-        days_to_failure = estimate_days_to_failure(
-            row['equipment_age_months'],
-            row['last_maintenance_days'],
-            row['priority']
+Here is the data (columns may include: asset_id, asset_type, problem_description, etc):
+
+{csv_chunk.to_csv(index=False)}
+"""
+
+def summarize_batch(batch_df, batch_number):
+    prompt = generate_prompt(batch_df)
+
+    try:
+        response = openai.ChatCompletion.create(
+            model="gpt-4",  # You can change to "gpt-3.5-turbo" if needed
+            messages=[
+                {"role": "system", "content": "You are a helpful AI assistant for predictive maintenance insights."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.4,
+            max_tokens=1000
         )
 
-        risk_score = compute_downtime_risk_score(
-            row['equipment_age_months'],
-            row['downtime_hours'],
-            row['priority']
-        )
+        summary_json = response["choices"][0]["message"]["content"]
 
-        if row['priority'] in ['High', 'Critical']:
-            critical_assets.append({
-                "asset_id": row['asset_id'],
-                "asset_type": row['asset_type'],
-                "location": row['asset_location'],
-                "estimated_days_to_failure": days_to_failure,
-                "failure_confidence": round(min(0.95, 0.7 + risk_score / 20), 2),
-                "root_cause": row['root_cause'],
-                "last_maintenance_days": row['last_maintenance_days'],
-                "equipment_age_months": row['equipment_age_months'],
-                "downtime_risk_score": risk_score,
-                "recommendation": f"Check asset within {max(1, days_to_failure // 2)} days"
-            })
+        # Save each batch summary
+        output_path = Path(OUTPUT_FOLDER) / f"predictive_summary_batch_{batch_number}.json"
+        with open(output_path, "w") as f:
+            f.write(summary_json)
 
-    # Global Insights
-    root_causes = batch['root_cause'].value_counts().head(3).index.tolist()
-    priorities = batch['priority'].value_counts().to_dict()
-    avg_days_to_failure = (
-        sum([a['estimated_days_to_failure'] for a in critical_assets]) / len(critical_assets)
-        if critical_assets else 0
-    )
+        return summary_json
 
-    summary = {
-        "batch_id": idx + 1,
-        "summary": {
-            "critical_assets_at_risk": critical_assets,
-            "global_insights": {
-                "most_common_root_causes": root_causes,
-                "average_days_to_next_failure": round(avg_days_to_failure, 2),
-                "total_assets_at_risk": len(critical_assets),
-                "priority_distribution": priorities
-            },
-            "actionable_recommendations": [
-                "Increase inspection frequency for assets >50 months old",
-                "Automate alerts for lubrication cycles >60 days",
-                "Pre-stock parts for frequently failing asset types"
-            ]
-        }
-    }
+    except Exception as e:
+        print(f"Error in batch {batch_number}: {e}")
+        return None
 
-    output_path = os.path.join(OUTPUT_DIR, f"predictive_summary_batch_{idx + 1}.json")
-    with open(output_path, "w") as f:
-        json.dump(summary, f, indent=2)
+# Process all batches
+batch_outputs = []
+for i, chunk in enumerate(chunk_dataframe(df, BATCH_SIZE), start=1):
+    print(f"Processing batch {i}...")
+    batch_output = summarize_batch(chunk, i)
+    if batch_output:
+        batch_outputs.append(batch_output)
 
-    print(f"Saved: {output_path}")
+# Combine all batch outputs into master summary
+all_assets = []
+for batch_json in batch_outputs:
+    try:
+        data = json.loads(batch_json)
+        all_assets.extend(data)
+    except Exception as e:
+        print("Error parsing batch JSON:", e)
+
+master_path = Path(OUTPUT_FOLDER) / "master_summary.json"
+with open(master_path, "w") as f:
+    json.dump(all_assets, f, indent=4)
+
+print("All summaries generated!")
